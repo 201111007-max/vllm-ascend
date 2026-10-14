@@ -342,6 +342,19 @@ def _clone_vpp_attn_metadata(attn_metadata: Any) -> None:
     _clone(attn_metadata)
 
 
+def _vpp_fold_transport() -> str:
+    """Transport for backward-sweep P2P ops on the cloned second PP group.
+
+    "hccl" (default): device tensors over the cloned HCCL group — with
+    direction-based channel assignment each group carries strictly
+    unidirectional p2p per rank pair, so HCCL FIFO pairing holds for any
+    vp_size.  "gloo": CPU-staged Gloo send/recv (PR #18018 variant), kept
+    as an escape hatch via VLLM_ASCEND_VPP_FOLD_TRANSPORT=gloo.
+    """
+    import os
+    return os.getenv("VLLM_ASCEND_VPP_FOLD_TRANSPORT", "hccl").lower()
+
+
 def init_model_parallel_group(pp_group: GroupCoordinator, usage: str) -> GroupCoordinator:
     # Build with the concrete class of ``pp_group`` (GroupCoordinatorPatch under
     # VPP) rather than the module-local ``GroupCoordinator`` name. The module's
@@ -3298,23 +3311,24 @@ class NPUModelRunner(GPUModelRunner):
             comm = get_vpp_comm_info(pp_rank, pp_size, vp_stage, ctx.vp_size)
 
             if comm.need_recv:
-                # Check if the sender is a fold-point rank that sent via
-                # CPU Gloo (to avoid HCCL stream deadlock).
-                fold_recv = (
-                    vp_stage > 0
-                    and is_vpp_fold_point(
-                        comm.recv_src, pp_size, vp_stage - 1, ctx.vp_size
-                    )
-                )
-                if fold_recv:
-                    # Fold recv routed off the HCCL device stream (see
-                    # GroupCoordinatorPatch.recv_tensor_dict_cpu): the matching
-                    # fold send is posted in a prior engine RPC round, so an
-                    # HCCL irecv here would stall the communicator.
-                    _r = self._vpp_pp_group_next.recv_tensor_dict_cpu(
-                        src=comm.recv_src,
-                    )
-                    intermediate_tensors = IntermediateTensors(_r)
+                # Channel by sweep direction (the PPT dual-channel design):
+                # forward-sweep traffic on the main PP group, backward-sweep
+                # traffic on the cloned second group. Each group then carries
+                # strictly unidirectional p2p per rank pair, so HCCL's
+                # in-order per-group stream pairs up for any vp_size.
+                if comm.recv_src > pp_rank:
+                    if _vpp_fold_transport() == "gloo":
+                        _r = self._vpp_pp_group_next.recv_tensor_dict_cpu(
+                            src=comm.recv_src,
+                        )
+                        intermediate_tensors = IntermediateTensors(_r)
+                    else:
+                        intermediate_tensors = IntermediateTensors(
+                            self._vpp_pp_group_next.recv_tensor_dict(
+                                src=comm.recv_src,
+                                all_gather_group=all_gather_group,
+                            )
+                        )
                 else:
                     intermediate_tensors = IntermediateTensors(
                         self._vpp_pp_group_prev.recv_tensor_dict(
@@ -3374,17 +3388,23 @@ class NPUModelRunner(GPUModelRunner):
 
             assert isinstance(hidden_states, IntermediateTensors)
             if comm.need_send:
-                if continued_across_fold_point:
-                    # Fold-point send: route through CPU Gloo backend to
-                    # avoid HCCL stream deadlock.  HCCL serialises ops
-                    # within a process-group, so a fold-point isend whose
-                    # matching recv is in a later RPC call blocks all
-                    # subsequent HCCL recv ops for other batches.  Gloo
-                    # uses TCP buffering and does not have this issue.
-                    self._vpp_pp_group_next.send_tensor_dict_cpu(
-                        hidden_states.tensors,
-                        dst=comm.send_dst,
-                    )
+                if comm.send_dst < pp_rank:
+                    # Backward-sweep send: cloned second group (see the recv
+                    # side above). Its matching recv may land in a later
+                    # engine RPC round; the non-blocking metadata isend +
+                    # async HCCL send machinery keeps that safe.
+                    if _vpp_fold_transport() == "gloo":
+                        self._vpp_pp_group_next.send_tensor_dict_cpu(
+                            hidden_states.tensors,
+                            dst=comm.send_dst,
+                        )
+                    else:
+                        self._vpp_pp_group_next.send_tensor_dict(
+                            hidden_states.tensors,
+                            dst=comm.send_dst,
+                            all_gather_group=all_gather_group,
+                            is_async=True,
+                        )
                 else:
                     self._vpp_pp_group_prev.send_tensor_dict(
                         hidden_states.tensors,

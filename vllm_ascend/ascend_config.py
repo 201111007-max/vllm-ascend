@@ -856,14 +856,19 @@ class AscendConfig:
         pp_size = vllm_config.parallel_config.pipeline_parallel_size
         self.vpp_layer_ranges: list[list[tuple[int, int]]] | None = None
         if vp_size > 1:
-            if pp_size < vp_size:
+            if pp_size < 2:
                 raise ValueError(
                     "virtual_pipeline_parallel_size > 1 requires "
-                    "pipeline_parallel_size >= vp_size.")
+                    "pipeline_parallel_size >= 2.")
             if vp_size != 2:
-                raise ValueError(
-                    "currently virtual_pipeline_parallel requires vp_size == 2"
-                )
+                # The fold-back scheduling/communication path in vpp_utils
+                # and model_runner_v1 is generic in vp_size; only vp_size == 2
+                # was validated upstream (PR #14945/#18018), so warn rather
+                # than reject other sizes.
+                logger.warning(
+                    "VPP vp_size=%d (pp_size=%d) has not been validated "
+                    "upstream (only vp_size == 2 was verified); proceeding "
+                    "on the generic fold-back path.", vp_size, pp_size)
             num_layers = vllm_config.model_config.hf_text_config.num_hidden_layers
             raw_ranges = _additional_config.get("vpp_layer_ranges", None)
             if raw_ranges is None:
