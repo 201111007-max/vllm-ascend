@@ -99,6 +99,12 @@ def _maybe_set_vpp_moe_layers(forward_context, model_instance: torch.nn.Module |
         return
 
     model = getattr(model_instance, "model", None)
+    if model is None and hasattr(model_instance, "language_model"):
+        # Multimodal *ForConditionalGeneration wrappers nest the decoder one
+        # level deeper (language_model.model); without this fallback the
+        # narrowing below silently no-ops and every vp>0 stage resolves its
+        # MoE custom-op calls to vp0's expert layers.
+        model = getattr(model_instance.language_model, "model", None)
     model_layers = getattr(model, "layers", None)
     vpp_layer_ranges = getattr(model_layers, "vpp_layer_ranges", None)
     if vpp_layer_ranges is None or model_layers is None:

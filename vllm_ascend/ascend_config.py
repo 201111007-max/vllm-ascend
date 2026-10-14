@@ -866,6 +866,13 @@ class AscendConfig:
                 )
             num_layers = vllm_config.model_config.hf_text_config.num_hidden_layers
             raw_ranges = _additional_config.get("vpp_layer_ranges", None)
+            if raw_ranges is None:
+                # additional_config 注入会被 pydantic 拒绝，与 VPP_SIZE 一样
+                # 提供 env 回退通道：VPP_LAYER_RANGES='[[[0,15],[15,30]],[[30,45],[45,60]]]'
+                import json
+                env_ranges = os.getenv("VPP_LAYER_RANGES", None)
+                if env_ranges is not None:
+                    raw_ranges = json.loads(env_ranges)
             if raw_ranges is not None:
                 from vllm_ascend.distributed.vpp_utils import validate_vpp_layer_ranges
                 self.vpp_layer_ranges = validate_vpp_layer_ranges(

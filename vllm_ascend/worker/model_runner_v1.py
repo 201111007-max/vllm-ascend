@@ -4047,7 +4047,13 @@ class NPUModelRunner(GPUModelRunner):
         # Virtual Pipeline Parallism: fix the start_layer and end_layer for
         # inner_model to the current virtual stage's slice.
         if self._get_vpp_size() > 1:
-            inner_model = self.model.model
+            # ForCausalLM models expose the decoder as ``.model`` directly;
+            # multimodal *ForConditionalGeneration wrappers nest it one
+            # level deeper at ``.language_model.model``.
+            inner_holder = self.model
+            if not hasattr(inner_holder, 'model') and hasattr(inner_holder, 'language_model'):
+                inner_holder = inner_holder.language_model
+            inner_model = inner_holder.model
             vpp_ranges = getattr(inner_model.layers, "vpp_layer_ranges", None)
             if vpp_ranges is not None:
                 inner_model.start_layer, inner_model.end_layer = vpp_ranges[get_virtual_pipeline_parallel_rank()]
