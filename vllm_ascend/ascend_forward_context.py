@@ -118,7 +118,12 @@ def _maybe_set_vpp_moe_layers(forward_context, model_instance: torch.nn.Module |
     stage_moe_layers: list[str] = []
     for layer_idx in range(start, end):
         layer = model_layers[layer_idx]
-        experts = getattr(getattr(layer, "mlp", None), "experts", None)
+        # MoE block naming differs across models: Qwen-style ``.mlp``,
+        # MiniMax-M2-style ``.block_sparse_moe``.
+        mlp = getattr(layer, "mlp", None)
+        if mlp is None:
+            mlp = getattr(layer, "block_sparse_moe", None)
+        experts = getattr(mlp, "experts", None)
         layer_name = getattr(experts, "layer_name", None)
         if layer_name is not None:
             stage_moe_layers.append(layer_name)

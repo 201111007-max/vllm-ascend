@@ -310,36 +310,74 @@ def _clone_vpp_attn_metadata(attn_metadata: Any) -> None:
     the other reads it, the kernel faults with an AICore exception. Tensors
     reachable directly (dataclass fields) AND nested inside containers are
     cloned in place; NPU Events / non-tensors are left shared by reference,
-    which is safe. Recursion is guarded by object ``id`` to avoid cycles.
+    which is safe.
+
+    Two memo tables are needed, not one: an *object* memo guards against
+    infinite recursion on cyclic references, while a separate *tensor* memo
+    preserves aliasing — builders legitimately share one tensor between two
+    fields (e.g. GDN stores ``non_spec_query_start_loc`` both at the top level
+    and inside ``non_spec_prefill_metadata.causal_conv1d.query_start_loc``).
+    Plain per-field cloning would leave the second alias pointing at the
+    original shared buffer, which the next batch's build then overwrites.
     """
-    _seen = set()
+    _seen_objs: set[int] = set()
+    _tensor_memo: dict[int, torch.Tensor] = {}
+
+    def _clone_tensor(v: torch.Tensor) -> torch.Tensor:
+        key = id(v)
+        if key not in _tensor_memo:
+            _tensor_memo[key] = v.clone()
+        return _tensor_memo[key]
 
     def _clone(md: Any) -> None:
-        if id(md) in _seen:
+        if id(md) in _seen_objs:
             return
-        _seen.add(id(md))
-        fds = getattr(md, "__dataclass_fields__", None)
-        if fds is not None:
-            for fn in fds:
+        _seen_objs.add(id(md))
+        if getattr(md, "__dataclass_fields__", None) is not None:
+            # Iterate the instance __dict__ rather than __dataclass_fields__:
+            # builders attach runtime-only attributes that are NOT declared
+            # fields (e.g. GDN's ``non_spec_prefill_metadata`` /
+            # ``*_decode_metadata``), and those hold the tensors that actually
+            # feed the kernels.
+            names = (list(vars(md).keys()) if hasattr(md, "__dict__")
+                     else list(md.__dataclass_fields__))
+            for fn in names:
                 v = getattr(md, fn, None)
                 if isinstance(v, torch.Tensor):
-                    setattr(md, fn, v.clone())
+                    setattr(md, fn, _clone_tensor(v))
                 else:
                     _clone(v)
         elif isinstance(md, dict):
             for k, v in md.items():
                 if isinstance(v, torch.Tensor):
-                    md[k] = v.clone()
+                    md[k] = _clone_tensor(v)
                 else:
                     _clone(v)
         elif isinstance(md, list):
             for i, v in enumerate(md):
                 if isinstance(v, torch.Tensor):
-                    md[i] = v.clone()
+                    md[i] = _clone_tensor(v)
                 else:
+                    _clone(v)
+        elif isinstance(md, tuple):
+            # Tuples are immutable, so their direct tensor items cannot be
+            # swapped for clones; recurse into non-tensor items so nested
+            # mutable structures are still cloned in place.
+            for v in md:
+                if not isinstance(v, torch.Tensor):
                     _clone(v)
 
     _clone(attn_metadata)
+
+
+def _vpp_fold_no_presync() -> bool:
+    import os
+    return os.getenv("VLLM_ASCEND_VPP_FOLD_NO_PRESYNC", "0") == "1"
+
+
+def _vpp_debug() -> bool:
+    import os
+    return os.getenv("VLLM_ASCEND_VPP_DEBUG", "0") == "1"
 
 
 def _vpp_fold_transport() -> str:
@@ -3269,9 +3307,17 @@ class NPUModelRunner(GPUModelRunner):
             batch_desc=batch_desc,
             cudagraph_mode=cudagraph_mode,
             num_tokens_across_dp=num_tokens_across_dp,
-            input_ids=input_ids,
-            inputs_embeds=inputs_embeds,
-            positions=positions,
+            # Clone the token/position tensors: ``_preprocess`` returns views
+            # into the runner's persistent buffers (``self.input_ids.gpu`` /
+            # ``self.positions``), which the NEXT batch's prepare overwrites
+            # while this batch is still suspended across VPP yields.  A stale
+            # view corrupts rope positions on resume (aivec faults / shape
+            # mismatch), so each in-flight batch must own its copies.
+            input_ids=input_ids.clone() if input_ids is not None else None,
+            inputs_embeds=inputs_embeds.clone()
+            if inputs_embeds is not None
+            else None,
+            positions=positions.clone(),
             model_kwargs=model_kwargs,
             ec_connector_output=ec_connector_output,
             cudagraph_stats=cudagraph_stats,
@@ -3307,6 +3353,10 @@ class NPUModelRunner(GPUModelRunner):
         while ctx.next_vp_stage < ctx.vp_size:
             vp_stage = ctx.next_vp_stage
             set_virtual_pipeline_parallel_rank(vp_stage)
+            if _vpp_debug():
+                print(f"[VPPDBG] run_stage batch={ctx.batch_id} vp={vp_stage} "
+                      f"tokens={ctx.num_tokens_padded} reqs={ctx.num_reqs} "
+                      f"qsl={ctx.query_start_loc_cpu_snapshot.tolist()[:8]}", flush=True)
 
             comm = get_vpp_comm_info(pp_rank, pp_size, vp_stage, ctx.vp_size)
 
@@ -3341,6 +3391,15 @@ class NPUModelRunner(GPUModelRunner):
                 )
             elif vp_stage > 0:
                 intermediate_tensors = ctx.carry_intermediate_tensors
+
+            # Re-stamp the global cos/sin cache from THIS batch's positions.
+            # ``_prepare_vpp_context`` stamps it once per *new* batch, but VPP
+            # keeps batches in flight across yields: another batch's prepare
+            # may have overwritten the shared ``_cos_slice``/``_sin_slice``
+            # globals while this batch was suspended.  The rope kernels read
+            # those globals, so every stage entry must restore them from the
+            # ctx snapshot before forwarding.
+            update_cos_sin(ctx.positions)
 
             with (
                 record_function_or_nullcontext("forward"),
@@ -3387,7 +3446,15 @@ class NPUModelRunner(GPUModelRunner):
                 )
 
             assert isinstance(hidden_states, IntermediateTensors)
-            if comm.need_send:
+            if comm.need_send and not _vpp_fold_no_presync():
+                # The async (is_async=True) HCCL send below reads
+                # ``hidden_states`` on the comm stream; drain the compute
+                # stream first so the send never captures half-written
+                # activations.  The continuation RPC roundtrip hides most of
+                # the wait.  VLLM_ASCEND_VPP_FOLD_NO_PRESYNC=1 disables this
+                # (debug/perf experiments only).
+                torch.npu.current_stream().synchronize()
+
                 if comm.send_dst < pp_rank:
                     # Backward-sweep send: cloned second group (see the recv
                     # side above). Its matching recv may land in a later
