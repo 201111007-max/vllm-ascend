@@ -380,6 +380,11 @@ def _vpp_debug() -> bool:
     return os.getenv("VLLM_ASCEND_VPP_DEBUG", "0") == "1"
 
 
+def _vpp_fold_no_ag() -> bool:
+    import os
+    return os.getenv("VLLM_ASCEND_VPP_FOLD_NO_AG", "0") == "1"
+
+
 def _vpp_fold_transport() -> str:
     """Transport for backward-sweep P2P ops on the cloned second PP group.
 
@@ -507,6 +512,10 @@ class VppBatchContext:
     next_vp_stage: int = 0
     carry_intermediate_tensors: IntermediateTensors | None = None
     pending_noop_cleanup: bool = False
+    # Decision-free chaining hint from the engine (SchedulerOutput.vpp_chain):
+    # run every local virtual stage in this call, letting need_recv block on
+    # the peer's async send, instead of yielding at cross-rank boundaries.
+    chain: bool = False
 
 
 @dataclass
@@ -3000,6 +3009,12 @@ class NPUModelRunner(GPUModelRunner):
             raise RuntimeError("VPP requires SchedulerOutput.batch_id")
 
         ctx = self._vpp_contexts.get(batch_id)
+        if _vpp_debug():
+            print(f"[VPPDBG] exec batch={batch_id} "
+                  f"resume={ctx is not None} "
+                  f"chain={getattr(scheduler_output, 'vpp_chain', False)} "
+                  f"tokens={scheduler_output.total_num_scheduled_tokens}",
+                  flush=True)
         if ctx is None:
             prepared = self._prepare_vpp_context(
                 scheduler_output, intermediate_tensors
@@ -3330,6 +3345,7 @@ class NPUModelRunner(GPUModelRunner):
                 : self.num_discarded_requests
             ].clone(),
             num_discarded_requests_snapshot=self.num_discarded_requests,
+            chain=getattr(scheduler_output, "vpp_chain", False),
         )
         return ctx, intermediate_tensors
 
@@ -3347,6 +3363,12 @@ class NPUModelRunner(GPUModelRunner):
         pp_rank = get_pp_group().rank_in_group
         pp_size = get_pp_group().world_size
         all_gather_group = get_tp_group() if not enable_sp() else None
+        if _vpp_fold_no_ag():
+            # Debug: plain P2P on fold channels (skip the sender-slice +
+            # receiver-all_gather reconstruction). Costs ~1-8ms/hop (fold
+            # payloads are 50-400MB over HCCS) but removes the TP-group
+            # collective from the continuation timing window.
+            all_gather_group = None
         aggregated_kv_connector_output = None
         continued_across_fold_point = False
 
@@ -3494,6 +3516,12 @@ class NPUModelRunner(GPUModelRunner):
                 continue
 
             if ctx.vp_size % 2 == 0 and ctx.next_vp_stage >= ctx.vp_size:
+                if ctx.chain:
+                    # Chained batch: this rank just finished its last local
+                    # stage and no second RPC will arrive. Let the loop
+                    # condition exit so the ctx is popped and the (discarded)
+                    # empty output returned below.
+                    continue
                 if continued_across_fold_point:
                     ctx.pending_noop_cleanup = True
                 else:
@@ -3501,6 +3529,13 @@ class NPUModelRunner(GPUModelRunner):
                 return self._make_vpp_empty_output(
                     aggregated_kv_connector_output
                 )
+
+            if ctx.chain:
+                # Decision-free handoff: chain into the next virtual stage
+                # in-process. The next loop iteration's need_recv posts a
+                # blocking recv that pairs directly with the peer's async
+                # send — the vanilla-PP skeleton, no engine roundtrip.
+                continue
 
             return VppContinuationOutput(
                 next_vp_stage=ctx.next_vp_stage,

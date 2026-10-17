@@ -44,6 +44,7 @@ patched separately via ``patch_vpp_make_layers`` / ``patch_multiproc_executor``.
 
 from __future__ import annotations
 
+import os
 from collections import deque
 from concurrent.futures import Future
 from typing import cast
@@ -57,6 +58,81 @@ from vllm.v1.outputs import ModelRunnerOutput, VppContinuationOutput
 # ``maxlen`` is too tight.  Value 10 is empirically sufficient; scale
 # proportionally with ``max_num_seqs`` if needed.
 _VPP_BATCH_QUEUE_HEADROOM = 10
+
+
+def _vpp_chain_enabled() -> bool:
+    """Allow workers to chain decision-free VPP stage handoffs in-process.
+
+    Default OFF: measured on MiniMax-M2.5/910B2C (2026-10-17), chaining is
+    correct but performance-neutral in every sustained scenario — the
+    continuation RPC roundtrip is already hidden by the batch-queue
+    pipeline (128K TTFT 10.42s vs 10.52s, decode 2.29 vs 2.26 tps, both
+    within noise; correctness byte-identical).  Kept as an opt-in
+    experiment knob via ``VLLM_ASCEND_VPP_CHAIN=1``.
+    """
+    return os.getenv("VLLM_ASCEND_VPP_CHAIN", "0") == "1"
+
+
+def _vpp_stamp_chain_hint(engine: EngineCore, scheduler_output, batch_queue) -> None:
+    """Stamp ``vpp_chain`` when no handoff of this batch is a real decision.
+
+    A cross-rank virtual-stage handoff is decision-free — the engine would
+    only relay it back unchanged — when nothing is waiting to be scheduled
+    AND either:
+
+      * this batch is decode-sized (<= 1 token per request): the interleave
+        value of a queued step (~one stage of tiny compute) is dwarfed by
+        the continuation RPC roundtrip (~0.7s measured), so chaining wins
+        even with a full queue; or
+      * every running request's prefill completes within the batches
+        already scheduled (no successor chunk will arrive to productively
+        fill this batch's mid-pipeline wait). This covers single-chunk
+        prompts AND the last chunk of a long prefill; chaining the last
+        chunk is safe even with a non-empty queue because everything ahead
+        of it is already dispatched to the workers, and it removes the
+        fold-return roundtrip from the TTFT critical path.
+
+    A mid-prefill chunk must NOT chain even when the queue is momentarily
+    empty: its successor chunk is about to be scheduled and would lose its
+    packing slot while this rank blocks on the fold-back recv.
+
+    Spec-decode and DP>1 are excluded conservatively: the draft-token flow
+    rides the continuation cadence, and DP peers could derive divergent
+    hints and desync collective RPC counts.
+    """
+    is_decode_only = (
+        scheduler_output.total_num_scheduled_tokens
+        <= len(scheduler_output.num_scheduled_tokens)
+    )
+    # Checked right after schedule(), so num_computed_tokens already covers
+    # this batch: a running request with num_computed < num_tokens still has
+    # prefill chunks coming and will fill the queue productively.
+    has_more_chunks = any(
+        req.num_computed_tokens < req.num_tokens
+        for req in engine.scheduler.running
+    )
+    scheduler_output.vpp_chain = (
+        _vpp_chain_enabled()
+        and not engine.scheduler.waiting
+        and not engine.use_spec_decode
+        and engine.vllm_config.parallel_config.data_parallel_size == 1
+        and engine._vpp_yielded_pending_recv == 0
+        and (is_decode_only or not has_more_chunks)
+    )
+    if os.getenv("VLLM_ASCEND_VPP_DEBUG", "0") == "1":
+        print(f"[VPPDBG] chain_hint batch={scheduler_output.batch_id} "
+              f"chain={scheduler_output.vpp_chain} "
+              f"tokens={scheduler_output.total_num_scheduled_tokens} "
+              f"reqs={len(scheduler_output.num_scheduled_tokens)} "
+              f"qsize={len(batch_queue)} waiting={len(engine.scheduler.waiting)} "
+              f"more_chunks={has_more_chunks} "
+              f"pending_recv={engine._vpp_yielded_pending_recv}",
+              flush=True)
+    if (not scheduler_output.vpp_chain
+            and scheduler_output.total_num_scheduled_tokens > 0):
+        # This batch will yield; its fold recv lands in the continuation
+        # RPC.  Block chaining of younger batches until it is done.
+        engine._vpp_yielded_pending_recv += 1
 
 # ---------------------------------------------------------------------------
 # EngineCore.__init__ — VPP-aware setup
@@ -88,6 +164,15 @@ def _ascend_vpp_post_init(self: EngineCore) -> None:
 
     self.allow_over_batch_queue = False
     self._deferred_scheduler_output = None
+    # Count of in-flight YIELDED batches whose fold-back recv has not yet
+    # completed.  A chained batch posts its fold recv inside its own
+    # execute_model RPC, while a yielded batch posts it inside the later
+    # continuation RPC — so a chained batch issued while a yielded batch is
+    # still awaiting its continuation would jump ahead on the in-order fold
+    # channel and pair with the WRONG sender payload (shape-mismatch crash,
+    # or silent data corruption when shapes happen to match).  Chaining is
+    # therefore only allowed when no yielded fold recv is pending.
+    self._vpp_yielded_pending_recv = 0
 
     if self.vpp_enabled and self.batch_queue is not None:
         # VPP scheme2 needs one extra batch in flight so the fold-back
@@ -144,6 +229,7 @@ def _ascend_vpp_step_with_batch_queue(
     deferred_scheduler_output = None
     if can_schedule and self.scheduler.has_requests():
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+        _vpp_stamp_chain_hint(self, scheduler_output, batch_queue)
         with self.log_error_detail(scheduler_output):
             exec_future = self.model_executor.execute_model(scheduler_output, non_block=True)
         if self.is_ec_consumer:
@@ -211,6 +297,12 @@ def _ascend_vpp_step_with_batch_queue(
                 # execute_model() call failed - raise that exception.
                 exec_model_fut.result()
                 raise RuntimeError("unexpected error")
+            if not getattr(scheduler_output, "vpp_chain", False):
+                # A yielded batch's execute_model returning None means its
+                # last stage ran — its fold recv has completed on the
+                # channel, so younger batches may chain again.
+                self._vpp_yielded_pending_recv = max(
+                    0, self._vpp_yielded_pending_recv - 1)
             if scheduler_output.pending_structured_output_tokens:
                 self._deferred_scheduler_output = scheduler_output
                 return None, True

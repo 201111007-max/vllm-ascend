@@ -51,6 +51,16 @@ class SchedulerOutput(_UpstreamSchedulerOutput):
     # workers key their continuation-context dict on this value.
     batch_id: int = 0
 
+    # Decision-free chaining hint, stamped by the engine core after
+    # schedule(): when no other batch can productively interleave with this
+    # one (nothing waiting to schedule, and either the batch queue is empty
+    # or this is a decode-sized step whose interleave value is dwarfed by
+    # the continuation RPC roundtrip), VPP workers run every local virtual
+    # stage in a single execute_model call with blocking p2p recvs — the
+    # vanilla-PP skeleton — instead of yielding VppContinuationOutput at
+    # each cross-rank boundary.
+    vpp_chain: bool = False
+
 
 # ---------------------------------------------------------------------------
 # Install the replacement on the vLLM module.
