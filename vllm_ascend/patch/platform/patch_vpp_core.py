@@ -180,6 +180,13 @@ def _ascend_vpp_post_init(self: EngineCore) -> None:
         # dropping entries during the over-scheduled continuation cycle.
         self.batch_queue_size += 1
         self.batch_queue = deque(maxlen=self.batch_queue_size + _VPP_BATCH_QUEUE_HEADROOM)
+        if os.getenv("VLLM_ASCEND_VPP_FORCE_SERIAL", "0") == "1":
+            # bug#5 bisect knob: no batch pipelining — the engine issues the
+            # next batch only after the current one's future pops.  If the
+            # IndexCheck crash disappears in this mode, cross-batch in-flight
+            # state interference is a necessary condition.
+            self.batch_queue_size = 1
+            self.batch_queue = deque(maxlen=1 + _VPP_BATCH_QUEUE_HEADROOM)
 
 
 def _ascend_vpp_engine_core_init(self: EngineCore, *args, **kwargs) -> None:

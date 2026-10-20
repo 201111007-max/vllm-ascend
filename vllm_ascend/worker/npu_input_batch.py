@@ -359,13 +359,20 @@ class NPUInputBatch(InputBatch):
             vocab_size=self.vocab_size,
             block_sizes=self._block_sizes,
             kernel_block_sizes=self._kernel_block_sizes,
-            logitsprocs=_copy.deepcopy(self.logitsprocs),
+            logitsprocs=self.logitsprocs,
             logitsprocs_need_output_token_ids=self.logitsprocs_need_output_token_ids,
             is_spec_decode=self.is_spec_decode,
             is_pooling_model=self.is_pooling_model,
             num_speculative_tokens=self._num_speculative_tokens,
             cp_kv_cache_interleave_size=self._cp_kv_cache_interleave_size,
         )
+        # ``_acquire_for_clone``'s pool path discards the kwargs entirely
+        # (``_reset_for_clone`` does not touch ``logitsprocs``), so a recycled
+        # clone would keep the PREVIOUS tenant's processors — their row-keyed
+        # state (``min_toks``/``logits_slice``) then indexes this batch's
+        # smaller logits tensor in ``apply()`` (IndexCheck assert).  Stamp the
+        # deep copy explicitly on both the pooled and the fresh path.
+        clone.logitsprocs = _copy.deepcopy(self.logitsprocs)
 
         clone._req_ids = self._req_ids.copy()
         clone.req_id_to_index = self.req_id_to_index.copy()

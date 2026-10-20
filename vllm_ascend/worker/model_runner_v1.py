@@ -1571,6 +1571,41 @@ class NPUModelRunner(GPUModelRunner):
         # Build previous positions before DCP prepares speculative inputs.
         prev_req_id_to_index = self.input_batch.prev_req_id_to_index
         self._compute_prev_positions(num_reqs)
+        if _vpp_debug() and self._get_vpp_size() > 1:
+            # bug#5 probe: catch the prev_sampled/prev_positions inconsistency
+            # host-side BEFORE it launches the IndexCheck scatter on device.
+            _ps = self.input_batch.prev_sampled_token_ids
+            if _ps is not None and prev_req_id_to_index:
+                _pp = self.prev_positions.np[:num_reqs]
+                _oob = [(i, int(v)) for i, v in enumerate(_pp) if v >= _ps.shape[0]]
+                _map_max = max(prev_req_id_to_index.values())
+                if _oob or _map_max >= _ps.shape[0]:
+                    import os
+                    import json as _json
+                    _dump = {
+                        "batch_id": getattr(scheduler_output, "batch_id", None),
+                        "num_reqs": num_reqs,
+                        "prev_sampled_rows": int(_ps.shape[0]),
+                        "oob_positions": _oob[:16],
+                        "map_max": _map_max,
+                        "req_ids": list(self.input_batch.req_ids[:num_reqs]),
+                        "prev_req_id_to_index": dict(prev_req_id_to_index),
+                        "prev_positions": [int(v) for v in _pp],
+                        "new_token_ids_lens": [
+                            len(t) for t in
+                            scheduler_output.scheduled_cached_reqs.new_token_ids
+                        ],
+                        "sched_req_ids": list(
+                            scheduler_output.scheduled_cached_reqs.req_ids),
+                    }
+                    with open(f"/tmp/vpp_bug5_dump_{os.getpid()}.json", "a") as _f:
+                        _f.write(_json.dumps(_dump) + "\n")
+                    raise RuntimeError(
+                        f"VPP bug5 probe: prev_positions OOB rows={_ps.shape[0]} "
+                        f"oob={_oob[:4]} map_max={_map_max} "
+                        f"batch={_dump['batch_id']} dumped=/tmp/vpp_bug5_dump_{os.getpid()}.json"
+                    )
+
         prev_positions_gpu = None
         if (
             self.use_async_scheduling
@@ -3349,6 +3384,44 @@ class NPUModelRunner(GPUModelRunner):
         )
         return ctx, intermediate_tensors
 
+    def _vpp_bug5_probe_input_ids(self, ctx: "VppBatchContext", vp_stage: int) -> None:
+        """bug#5 probe: detect out-of-vocab / placeholder (-1) token ids before
+        they reach the embedding lookup (the IndexCheck crash site suspect).
+
+        Fully asynchronous: the bounds check runs on-device into a pinned flag,
+        and the PREVIOUS stage's flag is harvested here only when its event
+        already fired (zero added synchronisation, so the heisenbug's timing
+        is not perturbed).
+        """
+        if not hasattr(self, "_bug5_flag_pin"):
+            self._bug5_flag_pin = torch.zeros(1, dtype=torch.int64, pin_memory=True)
+            self._bug5_flag_dev = torch.zeros(1, dtype=torch.int64, device=self.device)
+            self._bug5_event = None
+            self._bug5_pending = None
+        # Harvest the previous stage's result (only if ready — no sync).
+        if self._bug5_event is not None and self._bug5_event.query():
+            if int(self._bug5_flag_pin[0]) > 0 and self._bug5_pending is not None:
+                import os
+                import json as _json
+                _dump = {"site": "input_ids_oob", **self._bug5_pending}
+                with open(f"/tmp/vpp_bug5_dump_{os.getpid()}.json", "a") as _f:
+                    _f.write(_json.dumps(_dump) + "\n")
+                raise RuntimeError(f"VPP bug5 probe(input_ids): {_dump}")
+            self._bug5_event = None
+            self._bug5_pending = None
+        # Launch this stage's check.
+        bad = ((ctx.input_ids < 0) | (ctx.input_ids >= self.input_batch.vocab_size)).sum()
+        self._bug5_flag_dev.copy_(bad.reshape(1).to(torch.int64))
+        self._bug5_flag_pin.copy_(self._bug5_flag_dev, non_blocking=True)
+        self._bug5_event = torch.npu.Event()
+        self._bug5_event.record()
+        self._bug5_pending = {
+            "batch_id": ctx.batch_id, "vp_stage": vp_stage,
+            "num_reqs": ctx.num_reqs,
+            "req_ids": list(ctx.input_batch_snapshot.req_ids),
+            "num_tokens_padded": ctx.num_tokens_padded,
+        }
+
     def _run_vpp_stage(
         self,
         ctx: VppBatchContext,
@@ -3422,6 +3495,9 @@ class NPUModelRunner(GPUModelRunner):
             # those globals, so every stage entry must restore them from the
             # ctx snapshot before forwarding.
             update_cos_sin(ctx.positions)
+
+            if _vpp_debug() and ctx.input_ids is not None:
+                self._vpp_bug5_probe_input_ids(ctx, vp_stage)
 
             with (
                 record_function_or_nullcontext("forward"),
@@ -3569,6 +3645,28 @@ class NPUModelRunner(GPUModelRunner):
             # aware), so pull out the actual hidden-state tensor before
             # indexing it for logits.
             hidden_states = hidden_states["hidden_states"]
+        import os
+        if os.getenv("VLLM_ASCEND_VPP_DEBUG", "0") == "2":
+            # bug#5 probe: hidden_states[ctx.logits_indices] is the other
+            # IndexCheck candidate — validate bounds host-side first.
+            _li = ctx.logits_indices
+            if _li is not None and _li.numel() > 0:
+                _mx = int(_li.max().item())
+                _mn = int(_li.min().item())
+                if _mn < 0 or _mx >= hidden_states.shape[0]:
+                    import json as _json
+                    _dump = {
+                        "site": "postprocess_logits_indices",
+                        "batch_id": ctx.batch_id,
+                        "hidden_rows": int(hidden_states.shape[0]),
+                        "li_min": _mn, "li_max": _mx,
+                        "num_reqs": ctx.num_reqs,
+                        "num_tokens_padded": ctx.num_tokens_padded,
+                    }
+                    with open(f"/tmp/vpp_bug5_dump_{os.getpid()}.json", "a") as _f:
+                        _f.write(_json.dumps(_dump) + "\n")
+                    raise RuntimeError(f"VPP bug5 probe(postprocess): {_dump}")
+
         if not self.broadcast_pp_output:
             # `hidden_states` here is always a regular `torch.Tensor`:
             # this function is only called from `_run_vpp_stage` when
@@ -3647,6 +3745,7 @@ class NPUModelRunner(GPUModelRunner):
         prev_discard_request_indices = self.discard_request_indices.cpu[: prev_num_discarded_requests].clone()
 
         self.input_batch = pending_state.input_batch
+        self._vpp_in_pending_sample = True
         self.num_prompt_logprobs = pending_state.num_prompt_logprobs.copy()
         self.query_start_loc.cpu[: pending_state.query_start_loc_cpu.shape[0]].copy_(pending_state.query_start_loc_cpu)
         self.query_start_loc.copy_to_gpu(pending_state.query_start_loc_cpu.shape[0])
@@ -3659,6 +3758,7 @@ class NPUModelRunner(GPUModelRunner):
         try:
             yield
         finally:
+            self._vpp_in_pending_sample = False
             self.input_batch = prev_input_batch
             self.num_prompt_logprobs = prev_num_prompt_logprobs
             self.query_start_loc.cpu[: prev_query_start_loc.shape[0]].copy_(prev_query_start_loc)
@@ -3900,6 +4000,32 @@ class NPUModelRunner(GPUModelRunner):
         # Sample the next token and get logprobs if needed.
         self.input_batch.update_async_output_token_ids()
         sampling_metadata = self.input_batch.sampling_metadata
+        if _vpp_debug() and getattr(self, "_vpp_in_pending_sample", False):
+            # bug#5 probe: the pending sample runs the snapshot's frozen
+            # logitsprocs against this batch's frozen logits.  If the two
+            # disagree on row count, min-tokens' index_put_ launches an
+            # IndexCheck assert ("index value N exceeds bounds M").
+            _mt = None
+            for _p in sampling_metadata.logitsprocs.all:
+                _mt = getattr(_p, "min_toks", None)
+                if _mt:
+                    break
+            if _mt and logits is not None:
+                _bad = {k: v[0] for k, v in _mt.items() if k >= logits.shape[0]}
+                if _bad:
+                    import os
+                    import json as _json
+                    _dump = {
+                        "site": "mintoks_oob",
+                        "logits_rows": int(logits.shape[0]),
+                        "min_toks_keys": sorted(_mt.keys()),
+                        "oob": _bad,
+                        "snapshot_req_ids": list(self.input_batch.req_ids[: self.input_batch.num_reqs]),
+                        "snapshot_num_reqs": int(self.input_batch.num_reqs),
+                    }
+                    with open(f"/tmp/vpp_bug5_mintoks_{os.getpid()}.json", "a") as _f:
+                        _f.write(_json.dumps(_dump) + "\n")
+                    raise RuntimeError(f"VPP bug5 probe(mintoks): {_dump}")
         if spec_decode_metadata is None:
             if lmhead_tp_enable() and logits is not None:
                 logits = logits[: self.input_batch.num_reqs]
@@ -4039,14 +4165,28 @@ class NPUModelRunner(GPUModelRunner):
                 f"{self.max_model_len}"
             )
 
-            self.input_batch.token_ids_cpu[req_idx, start_idx:end_idx] = sampled_ids
-            self.input_batch.is_token_ids[req_idx, start_idx:end_idx] = True
+            import os
+            if not getattr(self, "_vpp_in_pending_sample", False) or os.getenv(
+                "VLLM_ASCEND_VPP_BUG5_NOCOPYFIX", "0"
+            ) == "1":
+                self.input_batch.token_ids_cpu[req_idx, start_idx:end_idx] = sampled_ids
+                self.input_batch.is_token_ids[req_idx, start_idx:end_idx] = True
+            # else: a VPP pending sample runs with a *snapshot* input batch
+            # whose row indices are frozen at yield time.  token_ids_cpu and
+            # is_token_ids are shared by reference with the live batch, so
+            # writing them here with snapshot rows corrupts whatever request
+            # the live batch has since condensed into those rows (a -1
+            # placeholder landing mid-prompt of another request crashes the
+            # next embedding lookup with IndexCheck).  The live batch's token
+            # cache is maintained by the scheduler-IPC/all_token_ids path in
+            # _update_states, so these writes are safely skipped.
             self.input_batch.num_tokens_no_spec[req_idx] = end_idx
             self.input_batch.num_tokens[req_idx] = end_idx
 
             req_id = req_ids[req_idx]
-            req_state = self.requests[req_id]
-            req_state.output_token_ids.extend(sampled_ids)
+            req_state = self.requests.get(req_id)
+            if req_state is not None:
+                req_state.output_token_ids.extend(sampled_ids)
 
         # logprobs_lists is already set above:
         # - max_gen_len == 1: logprobs_tensors.tolists() (no cu_num_tokens)
